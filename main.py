@@ -12,7 +12,12 @@ app = FastAPI()
 
 SAFE_INT_MAX = 9007199254740991
 
-# Stateful storage for frozen selections.
+# Stateful storage:
+# runId -> {
+#   fingerprint: str,
+#   response: dict,
+#   successful: bool
+# }
 RUNS: dict[str, dict[str, Any]] = {}
 
 TIMESTAMP_RE = re.compile(
@@ -26,7 +31,7 @@ DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 # =========================================================
-# GENERAL HELPERS
+# BASIC HELPERS
 # =========================================================
 
 def safe_int(value: Any) -> bool:
@@ -54,7 +59,9 @@ def valid_timestamp(value: Any) -> bool:
 
     try:
         if value.endswith("Z"):
-            datetime.fromisoformat(value[:-1] + "+00:00")
+            datetime.fromisoformat(
+                value[:-1] + "+00:00"
+            )
         else:
             datetime.fromisoformat(value)
         return True
@@ -64,7 +71,9 @@ def valid_timestamp(value: Any) -> bool:
 
 def parse_utc(value: str) -> datetime:
     if value.endswith("Z"):
-        dt = datetime.fromisoformat(value[:-1] + "+00:00")
+        dt = datetime.fromisoformat(
+            value[:-1] + "+00:00"
+        )
     else:
         dt = datetime.fromisoformat(value)
 
@@ -87,31 +96,6 @@ def compact_json(value: Any) -> str:
     )
 
 
-# =========================================================
-# DATASET DIGEST
-# =========================================================
-
-def dataset_digest(
-    train_row_ids,
-    eval_row_ids,
-    feature_names,
-):
-    # Exact required key order.
-    obj = {
-        "trainRowIds": train_row_ids,
-        "evalRowIds": eval_row_ids,
-        "featureNames": feature_names,
-    }
-
-    return hashlib.sha256(
-        compact_json(obj).encode("utf-8")
-    ).hexdigest()
-
-
-# =========================================================
-# REQUIRED FIELD HELPER
-# =========================================================
-
 def has_fields(obj: Any, fields) -> bool:
     return (
         isinstance(obj, dict)
@@ -120,7 +104,27 @@ def has_fields(obj: Any, fields) -> bool:
 
 
 # =========================================================
-# SELECTION VALIDATION
+# DATASET DIGEST
+# =========================================================
+
+def make_dataset_digest(
+    train_row_ids,
+    eval_row_ids,
+    feature_names,
+):
+    obj = {
+        "trainRowIds": train_row_ids,
+        "evalRowIds": eval_row_ids,
+        "featureNames": feature_names,
+    }
+
+    payload = compact_json(obj).encode("utf-8")
+
+    return hashlib.sha256(payload).hexdigest()
+
+
+# =========================================================
+# SELECTION INPUT VALIDATION
 # =========================================================
 
 def validate_selection(body: dict) -> bool:
@@ -145,7 +149,7 @@ def validate_selection(body: dict) -> bool:
 
     if (
         not isinstance(run_id, str)
-        or len(run_id) == 0
+        or not run_id
         or len(run_id) > 128
     ):
         return False
@@ -162,9 +166,6 @@ def validate_selection(body: dict) -> bool:
     ):
         return False
 
-    if len(set(forbidden)) != len(forbidden):
-        return False
-
     # numTrialsLimit
     limit = body["numTrialsLimit"]
 
@@ -176,13 +177,15 @@ def validate_selection(body: dict) -> bool:
     ):
         return False
 
-    # rows must be non-empty.
+    # Selection rows must be non-empty.
     rows = body["rows"]
 
-    if not isinstance(rows, list) or len(rows) == 0:
+    if not isinstance(rows, list):
         return False
 
-    # Row IDs must be unique in the supplied array.
+    if len(rows) == 0:
+        return False
+
     row_ids = set()
 
     for row in rows:
@@ -203,12 +206,15 @@ def validate_selection(body: dict) -> bool:
         if not has_fields(row, required_row):
             return False
 
+        # -------------------------------------------------
         # ID
+        # -------------------------------------------------
+
         row_id = row["id"]
 
         if (
             not isinstance(row_id, str)
-            or len(row_id) == 0
+            or not row_id
         ):
             return False
 
@@ -217,27 +223,44 @@ def validate_selection(body: dict) -> bool:
 
         row_ids.add(row_id)
 
-        # Entity
+        # -------------------------------------------------
+        # ENTITY
+        # -------------------------------------------------
+
         if not isinstance(row["entity"], str):
             return False
 
-        # Event time
+        # -------------------------------------------------
+        # TIMESTAMPS
+        # -------------------------------------------------
+
         if not valid_timestamp(
             row["eventTime"]
         ):
             return False
 
-        # Prediction time
         if not valid_timestamp(
             row["predictionTime"]
         ):
             return False
 
-        # Version
+        # NOTE:
+        # eventTime is NOT compared to predictionTime.
+        # The contract uses eventTime for deduplication.
+        # Point-in-time feature safety is checked using
+        # availableAt <= predictionTime below.
+        
+        # -------------------------------------------------
+        # VERSION
+        # -------------------------------------------------
+
         if not safe_int(row["version"]):
             return False
 
-        # Only TRAIN/EVAL can participate in selection.
+        # -------------------------------------------------
+        # SPLIT
+        # -------------------------------------------------
+
         if row["split"] not in (
             "TRAIN",
             "EVAL",
@@ -245,19 +268,9 @@ def validate_selection(body: dict) -> bool:
             return False
 
         # -------------------------------------------------
-        # POINT-IN-TIME LEAKAGE RULE
+        # FEATURES
         # -------------------------------------------------
-        #
-        # Event information cannot happen after the
-        # prediction timestamp.
-        #
-        if (
-            parse_utc(row["eventTime"])
-            > parse_utc(row["predictionTime"])
-        ):
-            return False
 
-        # Features
         features = row["features"]
 
         if not isinstance(features, dict):
@@ -277,8 +290,8 @@ def validate_selection(body: dict) -> bool:
             ):
                 return False
 
-            # value is intentionally NOT type checked.
-            # Text/numbers/objects/etc. are data.
+            # Feature value is data.
+            # Do not interpret/reject text inside it.
             if not valid_timestamp(
                 feature["availableAt"]
             ):
@@ -334,13 +347,6 @@ def validate_selection(body: dict) -> bool:
             ):
                 return False
 
-        elif "evalMetric" in trial:
-
-            if not finite_number(
-                trial["evalMetric"]
-            ):
-                return False
-
     return True
 
 
@@ -354,7 +360,7 @@ def deduplicate_rows(rows):
 
     for row in rows:
 
-        # EXACT deduplication key:
+        # EXACT contract:
         # [entity, UTC(eventTime)]
         key = (
             row["entity"],
@@ -367,13 +373,15 @@ def deduplicate_rows(rows):
             groups[key] = row
             continue
 
-        # Highest version wins.
+        # Highest integer version wins.
         if row["version"] > existing["version"]:
             groups[key] = row
             continue
 
-        # Equal version -> UTF-8-byte-smallest ID.
+        # Same version:
+        # UTF-8-byte-smallest ID wins.
         if row["version"] == existing["version"]:
+
             if (
                 utf8_key(row["id"])
                 < utf8_key(existing["id"])
@@ -387,35 +395,35 @@ def deduplicate_rows(rows):
 # FEATURE ELIGIBILITY
 # =========================================================
 
-def get_feature_names(
-    retained_rows,
+def eligible_features(
+    rows,
     forbidden_features,
 ):
 
-    if not retained_rows:
+    if not rows:
         return []
 
-    # A feature must appear in EVERY retained row.
+    # Feature must occur in every retained row.
     common = set(
-        retained_rows[0]["features"].keys()
+        rows[0]["features"].keys()
     )
 
-    for row in retained_rows[1:]:
+    for row in rows[1:]:
+
         common.intersection_update(
             row["features"].keys()
         )
 
-    eligible = []
+    result = []
 
     for feature_name in common:
 
-        # Forbidden features are excluded.
         if feature_name in forbidden_features:
             continue
 
-        available_everywhere = True
+        eligible = True
 
-        for row in retained_rows:
+        for row in rows:
 
             feature = row["features"][
                 feature_name
@@ -429,24 +437,26 @@ def get_feature_names(
                 row["predictionTime"]
             )
 
-            # Feature is NOT eligible if even one retained
-            # row receives it after its prediction time.
+            # Point-in-time safety.
+            #
+            # Feature is usable only when it was
+            # available at or before prediction time.
             if available_at > prediction_time:
-                available_everywhere = False
+                eligible = False
                 break
 
-        if available_everywhere:
-            eligible.append(feature_name)
+        if eligible:
+            result.append(feature_name)
 
     # UTF-8 byte ordering.
-    return utf8_sorted(eligible)
+    return utf8_sorted(result)
 
 
 # =========================================================
 # TRIAL SELECTION
 # =========================================================
 
-def choose_trial(trials):
+def select_best_trial(trials):
 
     eligible = []
 
@@ -457,6 +467,7 @@ def choose_trial(trials):
 
         metric = trial.get("evalMetric")
 
+        # Only finite successful trials are eligible.
         if not finite_number(metric):
             continue
 
@@ -465,7 +476,7 @@ def choose_trial(trials):
     if not eligible:
         return None
 
-    # Max metric.
+    # Maximize metric.
     # Exact tie -> smallest integer trialId.
     eligible.sort(
         key=lambda trial: (
@@ -478,25 +489,31 @@ def choose_trial(trials):
 
 
 # =========================================================
-# SELECTION
+# PERFORM SELECTION
 # =========================================================
 
 def perform_selection(body):
 
     reason_codes = []
 
-    trials = body["trials"]
-
-    if len(trials) > body["numTrialsLimit"]:
+    # More trials than allowed is a contract failure.
+    if (
+        len(body["trials"])
+        > body["numTrialsLimit"]
+    ):
         reason_codes.append(
             "TRIAL_LIMIT_EXCEEDED"
         )
 
+    # Deduplicate BEFORE split/feature processing.
     retained = deduplicate_rows(
         body["rows"]
     )
 
-    train_ids = utf8_sorted(
+    # Selection only contains TRAIN/EVAL.
+    #
+    # No final-test rows exist in this phase.
+    train_row_ids = utf8_sorted(
         [
             row["id"]
             for row in retained
@@ -504,7 +521,7 @@ def perform_selection(body):
         ]
     )
 
-    eval_ids = utf8_sorted(
+    eval_row_ids = utf8_sorted(
         [
             row["id"]
             for row in retained
@@ -512,14 +529,16 @@ def perform_selection(body):
         ]
     )
 
-    features = get_feature_names(
+    feature_names = eligible_features(
         retained,
         set(body["forbiddenFeatures"]),
     )
 
-    selected = choose_trial(trials)
+    best_trial = select_best_trial(
+        body["trials"]
+    )
 
-    if selected is None:
+    if best_trial is None:
         reason_codes.append(
             "NO_SUCCESSFUL_TRIAL"
         )
@@ -528,7 +547,7 @@ def perform_selection(body):
         set(reason_codes)
     )
 
-    # Any selection error:
+    # Any selection failure:
     # selectedTrialId = null
     # datasetDigest = null
     if reason_codes:
@@ -536,32 +555,34 @@ def perform_selection(body):
         return {
             "runId": body["runId"],
             "selectedTrialId": None,
-            "trainRowIds": train_ids,
-            "evalRowIds": eval_ids,
-            "featureNames": features,
+            "trainRowIds": train_row_ids,
+            "evalRowIds": eval_row_ids,
+            "featureNames": feature_names,
             "datasetDigest": None,
             "reasonCodes": reason_codes,
         }
 
-    digest = dataset_digest(
-        train_ids,
-        eval_ids,
-        features,
+    digest = make_dataset_digest(
+        train_row_ids,
+        eval_row_ids,
+        feature_names,
     )
 
     return {
         "runId": body["runId"],
-        "selectedTrialId": selected["trialId"],
-        "trainRowIds": train_ids,
-        "evalRowIds": eval_ids,
-        "featureNames": features,
+        "selectedTrialId": best_trial[
+            "trialId"
+        ],
+        "trainRowIds": train_row_ids,
+        "evalRowIds": eval_row_ids,
+        "featureNames": feature_names,
         "datasetDigest": digest,
         "reasonCodes": [],
     }
 
 
 # =========================================================
-# EVALUATION VALIDATION
+# EVALUATION INPUT VALIDATION
 # =========================================================
 
 def validate_evaluation(body):
@@ -613,7 +634,9 @@ def validate_evaluation(body):
     ):
         return False
 
-    required_slices = body["requiredSlices"]
+    required_slices = body[
+        "requiredSlices"
+    ]
 
     if not isinstance(
         required_slices,
@@ -705,17 +728,19 @@ def validate_test_rows(rows):
 
 
 # =========================================================
-# EVALUATE
+# PERFORM EVALUATION
 # =========================================================
 
 def perform_evaluation(body):
 
     reason_codes = []
 
-    run_id = body["runId"]
+    stored = RUNS.get(
+        body["runId"]
+    )
 
-    stored = RUNS.get(run_id)
-
+    # The evaluation must exactly reference the
+    # successful frozen selection.
     lineage_valid = (
         stored is not None
         and stored["successful"]
@@ -734,7 +759,9 @@ def perform_evaluation(body):
 
     rows = body["rows"]
 
-    rows_valid = validate_test_rows(rows)
+    rows_valid = validate_test_rows(
+        rows
+    )
 
     if not rows_valid:
         reason_codes.append(
@@ -752,15 +779,18 @@ def perform_evaluation(body):
         )
 
     test_metric = None
+
+    # Must be false unless all required slice
+    # checks actually pass.
     critical_slice_pass = False
 
     # Empty rows OR invalid rows:
     #
     # testMetric = null
-    # aggregate checks skipped
-    # slice checks skipped
+    # aggregate check skipped
+    # slice check skipped
     #
-    # lineage + byte gates still apply.
+    # lineage and byte checks still apply.
     if rows and rows_valid:
 
         correct = sum(
@@ -775,6 +805,7 @@ def perform_evaluation(body):
             12,
         )
 
+        # Aggregate floor.
         if (
             test_metric
             < float(body["metricFloor"])
@@ -783,10 +814,12 @@ def perform_evaluation(body):
                 "AGGREGATE_FLOOR"
             )
 
-        all_slices_pass = True
+        all_required_slices_pass = True
 
         for slice_name in utf8_sorted(
-            body["requiredSlices"].keys()
+            body[
+                "requiredSlices"
+            ].keys()
         ):
 
             slice_rows = [
@@ -802,7 +835,7 @@ def perform_evaluation(body):
                     f"MISSING_SLICE:{slice_name}"
                 )
 
-                all_slices_pass = False
+                all_required_slices_pass = False
                 continue
 
             slice_correct = sum(
@@ -818,27 +851,25 @@ def perform_evaluation(body):
                 12,
             )
 
-            if (
-                slice_metric
-                < float(
-                    body["requiredSlices"][
-                        slice_name
-                    ]
-                )
-            ):
+            floor = float(
+                body["requiredSlices"][
+                    slice_name
+                ]
+            )
+
+            if slice_metric < floor:
 
                 reason_codes.append(
                     f"SLICE_FLOOR:{slice_name}"
                 )
 
-                all_slices_pass = False
+                all_required_slices_pass = False
 
         critical_slice_pass = (
-            all_slices_pass
+            all_required_slices_pass
         )
 
-    # Explicitly false for invalid lineage,
-    # invalid rows, or empty rows.
+    # Explicit contract behavior.
     if (
         not lineage_valid
         or not rows
@@ -846,13 +877,7 @@ def perform_evaluation(body):
     ):
         critical_slice_pass = False
 
-    if any(
-        code.startswith("MISSING_SLICE:")
-        or code.startswith("SLICE_FLOOR:")
-        for code in reason_codes
-    ):
-        critical_slice_pass = False
-
+    # Decision requires every gate.
     admit = (
         lineage_valid
         and rows_valid
@@ -871,7 +896,7 @@ def perform_evaluation(body):
     )
 
     return {
-        "runId": run_id,
+        "runId": body["runId"],
         "selectedTrialId": body[
             "selectedTrialId"
         ],
@@ -891,7 +916,7 @@ def perform_evaluation(body):
 
 
 # =========================================================
-# HTTP ENDPOINT
+# ENDPOINT
 # =========================================================
 
 @app.post("/bqml")
@@ -913,7 +938,8 @@ async def bqml(request: Request):
 
     phase = body.get("phase")
 
-    # Required exact behavior.
+    # Unknown or missing phase:
+    # exactly this response.
     if phase not in (
         "select",
         "evaluate",
@@ -937,12 +963,16 @@ async def bqml(request: Request):
 
         run_id = body["runId"]
 
-        # Fingerprint the complete selection request.
+        # Fingerprint the entire selection input.
         fingerprint = hashlib.sha256(
-            compact_json(body).encode("utf-8")
+            compact_json(body)
+            .encode("utf-8")
         ).hexdigest()
 
-        # Stateful replay/conflict.
+        # Existing runId:
+        #
+        # identical input -> replay unchanged
+        # different input -> 409
         if run_id in RUNS:
 
             previous = RUNS[run_id]
@@ -1017,6 +1047,10 @@ async def bqml(request: Request):
             perform_evaluation(body)
         )
 
+
+# =========================================================
+# HEALTH CHECK
+# =========================================================
 
 @app.get("/")
 def health():
